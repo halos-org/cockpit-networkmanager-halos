@@ -10,9 +10,9 @@ help:
 	@echo "  clean       - Remove build artifacts"
 	@echo "  help        - Show this help"
 	@echo ""
-	@echo "Environment variables:"
-	@echo "  TEST_HOST   - Test device hostname (default: halos.local)"
-	@echo "  TEST_USER   - Test device username (default: mairas)"
+	@echo "Environment variables (set in .env or environment):"
+	@echo "  TEST_HOST   - Test device hostname (required - see .env.example)"
+	@echo "  TEST_USER   - Test device username (required - see .env.example)"
 
 build:
 	./scripts/build.sh

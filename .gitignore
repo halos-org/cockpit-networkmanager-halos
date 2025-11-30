@@ -1,5 +1,6 @@
 # Build artifacts
 cockpit-src/
+cockpit-src-local/
 *.deb
 *.buildinfo
 *.changes
@@ -16,3 +17,6 @@ debian/*.debhelper.log
 *~
 *.swp
 *.swo
+
+# Local environment configuration
+.env

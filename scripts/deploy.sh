@@ -4,9 +4,23 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Configuration
-TEST_HOST="${TEST_HOST:-halos.local}"
-TEST_USER="${TEST_USER:-mairas}"
+# Load environment variables from .env if it exists
+if [ -f "$PROJECT_DIR/.env" ]; then
+    set -a
+    source "$PROJECT_DIR/.env"
+    set +a
+fi
+
+# Configuration - these MUST be set in .env or environment
+if [ -z "$TEST_HOST" ]; then
+    echo "Error: TEST_HOST not set. Please create a .env file (see .env.example)"
+    exit 1
+fi
+
+if [ -z "$TEST_USER" ]; then
+    echo "Error: TEST_USER not set. Please create a .env file (see .env.example)"
+    exit 1
+fi
 
 cd "$PROJECT_DIR"
 
@@ -14,8 +28,8 @@ echo "========================================="
 echo "Deploying cockpit-networkmanager-halos"
 echo "========================================="
 
-# Find the .deb package
-DEB_FILE=$(ls -t ../cockpit-networkmanager-halos_*.deb 2>/dev/null | head -1)
+# Find the .deb package (in current directory)
+DEB_FILE=$(ls -t cockpit-networkmanager-halos_*.deb 2>/dev/null | head -1)
 
 if [ -z "$DEB_FILE" ]; then
     echo "Error: No .deb package found. Run build.sh first."

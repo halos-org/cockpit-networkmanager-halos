@@ -27,7 +27,8 @@ This package provides a replacement for the upstream `cockpit-networkmanager` pa
 
 - Docker Desktop or Docker Engine
 - Git
-- SSH access to test device (default: halos.local)
+- SSH access to test device
+- Local environment configuration (copy `.env.example` to `.env` and configure)
 
 ### Quick Start
 
@@ -47,30 +48,46 @@ This package provides a replacement for the upstream `cockpit-networkmanager` pa
 
 ### Development Iteration Cycle
 
-The typical development workflow:
+**Fast Local Development** (test uncommitted changes):
 
 ```bash
-# Edit code in hatlabs/cockpit fork (wifi branch)
+# Edit code in ../cockpit
 cd ../cockpit/pkg/networkmanager
-# ... make changes to wifi.jsx, wifi-dialogs.jsx, etc. ...
-git commit -m "feat(wifi): add network scanning"
-git push origin wifi
+# ... make changes to wifi.jsx, network-interface.jsx, etc. ...
 
-# Build and deploy
+# Build and deploy (no commit needed!)
 cd ../../cockpit-networkmanager-halos
-./run build      # Fetches latest from wifi branch, builds .deb
-./run deploy     # Deploys to halos.local, restarts Cockpit
+./run build --local    # Uses ../cockpit source, builds .deb
+./run deploy           # Deploys to configured test device, restarts Cockpit
 
-# Test at https://halos.local:9090
+# Test at https://<your-test-device>:9090
 ```
 
-**Target iteration time:** < 5 minutes (build + deploy)
+**Branch Testing** (test pushed GitHub branches):
+
+```bash
+# Build from specific branch
+./run build --branch fix/wifi-ssid-and-dialog-bugs
+./run deploy
+
+# Or build from default wifi branch
+./run build
+./run deploy
+```
+
+**Target iteration time:** < 2 minutes with `--local` (build + deploy)
 
 ### Available Commands
 
 Run `./run help` for full command list:
 
-- `./run build` - Build Debian package in Docker container
+**Build Options:**
+- `./run build` - Build from GitHub wifi branch (default)
+- `./run build --local` - Build from ../cockpit (local uncommitted changes)
+- `./run build --local /path` - Build from custom local path
+- `./run build --branch BRANCH` - Build from specific GitHub branch
+
+**Other Commands:**
 - `./run deploy` - Deploy package to test device
 - `./run test-cycle` - Full build + deploy cycle
 - `./run docker-build` - Build Docker image
@@ -78,12 +95,19 @@ Run `./run help` for full command list:
 
 ### Configuration
 
-Environment variables for deployment:
+Create a `.env` file from the template:
 
-- `TEST_HOST` - Test device hostname (default: halos.local)
-- `TEST_USER` - Test device username (default: mairas)
+```bash
+cp .env.example .env
+# Edit .env with your test device details
+```
 
-Example:
+Environment variables in `.env`:
+
+- `TEST_HOST` - Test device hostname (required)
+- `TEST_USER` - Test device SSH username (required)
+
+You can also override these via environment variables:
 
 ```bash
 TEST_HOST=192.168.1.100 TEST_USER=pi ./run deploy
