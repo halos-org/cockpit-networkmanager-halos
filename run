@@ -69,6 +69,7 @@ function clean {
 
 function hooks-install {
   #@ Install pre-commit hooks using lefthook
+  #@ Category: Utility
   if ! command -v lefthook &> /dev/null; then
     echo "Error: lefthook not found. Install with: brew install lefthook"
     exit 1
@@ -79,6 +80,7 @@ function hooks-install {
 
 function hooks-run {
   #@ Run pre-commit hooks manually
+  #@ Category: Utility
   if ! command -v lefthook &> /dev/null; then
     echo "Error: lefthook not found. Install with: brew install lefthook"
     exit 1
