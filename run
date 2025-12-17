@@ -67,6 +67,27 @@ function clean {
   echo "✅ Clean complete"
 }
 
+function hooks-install {
+  #@ Install pre-commit hooks using lefthook
+  #@ Category: Utility
+  if ! command -v lefthook &> /dev/null; then
+    echo "Error: lefthook not found. Install with: brew install lefthook"
+    exit 1
+  fi
+  lefthook install
+  echo "✅ Pre-commit hooks installed"
+}
+
+function hooks-run {
+  #@ Run pre-commit hooks manually
+  #@ Category: Utility
+  if ! command -v lefthook &> /dev/null; then
+    echo "Error: lefthook not found. Install with: brew install lefthook"
+    exit 1
+  fi
+  lefthook run pre-commit
+}
+
 function help {
   #@ Show available commands
   echo "cockpit-networkmanager-halos development commands:"
@@ -97,7 +118,7 @@ shift
 
 # Run command
 case "$COMMAND" in
-  build|deploy|test-cycle|docker-build|clean|help)
+  build|deploy|test-cycle|docker-build|clean|hooks-install|hooks-run|help)
     "$COMMAND" "$@"
     ;;
   *)

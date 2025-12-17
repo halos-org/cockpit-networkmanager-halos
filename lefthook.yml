@@ -1,0 +1,26 @@
+pre-commit:
+  parallel: true
+  commands:
+    eslint:
+      root: "cockpit-src/"
+      glob: "*.{js,jsx,ts,tsx}"
+      run: |
+        if [ -d cockpit-src/node_modules ]; then
+          cd cockpit-src && npm run eslint
+        else
+          echo "WARNING: node_modules not found, skipping"
+          exit 0
+        fi
+      fail_text: "Run 'npm run eslint' in cockpit-src/ to see issues."
+
+    stylelint:
+      root: "cockpit-src/"
+      glob: "*.{css,scss}"
+      run: |
+        if [ -d cockpit-src/node_modules ]; then
+          cd cockpit-src && npm run stylelint
+        else
+          echo "WARNING: node_modules not found, skipping"
+          exit 0
+        fi
+      fail_text: "Run 'npm run stylelint' in cockpit-src/ to see issues."
