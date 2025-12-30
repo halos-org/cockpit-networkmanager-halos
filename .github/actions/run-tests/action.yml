@@ -1,0 +1,15 @@
+name: 'Run Tests'
+description: 'Verify package builds successfully'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Build Docker image
+      run: docker compose -f docker/docker-compose.debtools.yml build debtools
+      shell: bash
+
+    - name: Build Debian package
+      run: |
+        docker compose -f docker/docker-compose.debtools.yml run --rm debtools \
+          dpkg-buildpackage -b -uc -us
+      shell: bash
