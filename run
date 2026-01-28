@@ -21,7 +21,12 @@ readonly PROJECT_ROOT=$(pwd)
 
 function debtools {
   #@ Run command in debtools container
-  docker compose -f docker/docker-compose.debtools.yml run --rm debtools "$@"
+  local env_args=()
+  # Pass through COCKPIT_BRANCH if set
+  if [[ -n "${COCKPIT_BRANCH:-}" ]]; then
+    env_args+=(-e "COCKPIT_BRANCH=${COCKPIT_BRANCH}")
+  fi
+  docker compose -f docker/docker-compose.debtools.yml run --rm "${env_args[@]}" debtools "$@"
 }
 
 ################################################################################
@@ -97,10 +102,14 @@ function help {
   echo "Commands:"
   grep -E "^function [a-z-]+ {$" "$0" | sed 's/function /  /; s/ {$//' | sort
   echo ""
+  echo "Environment variables:"
+  echo "  COCKPIT_BRANCH  - Git branch to build from (default: wifi)"
+  echo ""
   echo "Examples:"
-  echo "  ./run build        - Build package in Docker"
-  echo "  ./run deploy       - Deploy to test device"
-  echo "  ./run test-cycle   - Full build + deploy"
+  echo "  ./run build                              - Build from wifi branch"
+  echo "  COCKPIT_BRANCH=feat/foo ./run build      - Build from feature branch"
+  echo "  ./run deploy                             - Deploy to test device"
+  echo "  ./run test-cycle                         - Full build + deploy"
 }
 
 ################################################################################
