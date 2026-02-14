@@ -3,7 +3,7 @@
 # Uncomment this to turn on verbose mode.
 #export DH_VERBOSE=1
 
-export COCKPIT_REPO := https://github.com/hatlabs/cockpit.git
+export COCKPIT_REPO := https://github.com/halos-org/cockpit.git
 export COCKPIT_BRANCH ?= wifi
 export COCKPIT_DIR := $(CURDIR)/cockpit-src
 export LOCAL_COCKPIT_SRC ?=

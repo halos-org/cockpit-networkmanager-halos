@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: cockpit-networkmanager-halos
 Upstream-Contact: Matti Airas <matti.airas@hatlabs.fi>
-Source: https://github.com/hatlabs/cockpit-networkmanager-halos
+Source: https://github.com/halos-org/cockpit-networkmanager-halos
 
 Files: *
 Copyright: 2025 Hat Labs Oy

@@ -7,7 +7,7 @@ Build-Depends: debhelper-compat (= 13),
                npm,
                git
 Standards-Version: 4.6.0
-Homepage: https://github.com/hatlabs/cockpit
+Homepage: https://github.com/halos-org/cockpit
 
 Package: cockpit-networkmanager-halos
 Architecture: all
@@ -26,5 +26,5 @@ Description: Cockpit NetworkManager module with WiFi support for HaLOS
   - Access Point (hotspot) mode configuration
   - Simultaneous AP + Client mode support
  .
- This is a HaLOS-specific build from the hatlabs/cockpit fork (wifi branch)
+ This is a HaLOS-specific build from the halos-org/cockpit fork (wifi branch)
  with WiFi features under development for potential upstream contribution.
