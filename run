@@ -72,6 +72,35 @@ function clean {
   echo "✅ Clean complete"
 }
 
+function bumpversion {
+  #@ Bump version using bumpversion tool (patch|minor|major)
+  local BUMP_TYPE="${1:-}"
+
+  if [[ -z "$BUMP_TYPE" ]]; then
+    echo "Error: version bump type required"
+    echo "Usage: ./run bumpversion [patch|minor|major]"
+    exit 1
+  fi
+
+  if [[ ! "$BUMP_TYPE" =~ ^(patch|minor|major)$ ]]; then
+    echo "Error: invalid bump type '$BUMP_TYPE'"
+    echo "Usage: ./run bumpversion [patch|minor|major]"
+    exit 1
+  fi
+
+  echo "Bumping $BUMP_TYPE version..."
+
+  if ! command -v bumpversion &> /dev/null; then
+    echo "Error: bumpversion not installed"
+    echo "Install with: pip install bump2version"
+    exit 1
+  fi
+
+  command bumpversion "$BUMP_TYPE"
+
+  echo "Version bumped and committed successfully"
+}
+
 function hooks-install {
   #@ Install pre-commit hooks using lefthook
   #@ Category: Utility
@@ -127,7 +156,7 @@ shift
 
 # Run command
 case "$COMMAND" in
-  build|deploy|test-cycle|docker-build|clean|hooks-install|hooks-run|help)
+  build|bumpversion|deploy|test-cycle|docker-build|clean|hooks-install|hooks-run|help)
     "$COMMAND" "$@"
     ;;
   *)
