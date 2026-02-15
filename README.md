@@ -16,7 +16,7 @@ This package provides a replacement for the upstream `cockpit-networkmanager` pa
 
 ## Package Information
 
-- **Source**: Built from [hatlabs/cockpit](https://github.com/hatlabs/cockpit) (wifi branch)
+- **Source**: Built from [halos-org/cockpit](https://github.com/halos-org/cockpit) (wifi branch)
 - **Replaces**: cockpit-networkmanager (official package)
 - **Architecture**: all (platform-independent JavaScript/HTML/CSS)
 - **Dependencies**: cockpit (>= 276), network-manager (>= 1.20)
