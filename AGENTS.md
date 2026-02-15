@@ -60,8 +60,8 @@ cockpit-networkmanager-halos/
 ## Related Repositories
 
 - **halos-org/cockpit** (wifi branch): WiFi feature implementation
-- **halos-distro**: Workspace for HaLOS development
+- **halos**: Workspace for HaLOS development
 
 ## Git Workflow
 
-Follow PROJECT_PLANNING_GUIDE.md from halos-distro workspace.
+Follow PROJECT_PLANNING_GUIDE.md from halos workspace.
