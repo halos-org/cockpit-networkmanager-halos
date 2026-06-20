@@ -228,7 +228,7 @@ terminal_fallback() {
     fi
 
     local tmp
-    tmp="$(mktemp)" || return 1
+    tmp="$(mktemp)" || { write_breadcrumb "stranded" "terminal-fallback-write-failed"; return 1; }
     chmod 0600 "$tmp"
     # Transform the live keyfile: force ipv4=shared (no address) + ipv6=ignore,
     # drop bridge membership, and pass [802-11-wireless] / [802-11-wireless-
@@ -250,9 +250,9 @@ terminal_fallback() {
             if (!v4) { print "[ipv4]"; print "method=shared" }
             if (!v6) { print "[ipv6]"; print "method=ignore" }
         }
-    ' "$KEYFILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    ' "$KEYFILE" > "$tmp" || { rm -f "$tmp"; write_breadcrumb "stranded" "terminal-fallback-write-failed"; return 1; }
 
-    install -D -m 0600 -o root -g root "$tmp" "$KEYFILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    install -D -m 0600 -o root -g root "$tmp" "$KEYFILE" 2>/dev/null || { rm -f "$tmp"; write_breadcrumb "stranded" "terminal-fallback-write-failed"; return 1; }
     rm -f "$tmp"
     systemctl restart NetworkManager 2>/dev/null || true
 
