@@ -1,0 +1,16 @@
+[Unit]
+Description=HaLOS AP bridged-mode safety watchdog (boot verdict)
+Documentation=https://github.com/halos-org/cockpit/issues/79
+# Judge only after NetworkManager is up; the script itself waits (bounded) for
+# convergence before the verdict. Never order Before=NetworkManager.
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/halos/ap-bridge-watchdog.sh boot
+# Generous so a revert (which brings interfaces down/up) is never killed mid-way.
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

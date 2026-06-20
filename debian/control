@@ -13,7 +13,9 @@ Package: cockpit-networkmanager-halos
 Architecture: all
 Depends: ${misc:Depends},
          cockpit (>= 276),
-         network-manager (>= 1.20)
+         network-manager (>= 1.20),
+         iproute2,
+         iputils-ping
 Conflicts: cockpit-networkmanager
 Replaces: cockpit-networkmanager
 Provides: cockpit-networkmanager
