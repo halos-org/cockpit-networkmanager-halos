@@ -26,6 +26,24 @@ if [ "$MODE" != "ap" ]; then
     exit 0
 fi
 
+# A Bridged AP is a bridge port: the bridge owns L3, so there is no AP subnet
+# to NAT. Detect the bridge port directly and bail — a converted AP keeps a
+# stale ipv4.method=shared (ignored by NM on a port but still reported), so the
+# method check below is not enough on its own. Without this, IP_NET would fall
+# back to the phantom 10.42.0.0/24 and install bogus MASQUERADE/FORWARD rules.
+PORT_INFO=$(nmcli -t -f connection.slave-type,connection.master connection show "$CONNECTION_UUID" 2>/dev/null)
+SLAVE_TYPE=$(printf '%s\n' "$PORT_INFO" | sed -n 's/^connection\.slave-type://p')
+MASTER=$(printf '%s\n' "$PORT_INFO" | sed -n 's/^connection\.master://p')
+if [ "$SLAVE_TYPE" = "bridge" ] || [ -n "$MASTER" ]; then
+    exit 0
+fi
+
+# Only a genuine Isolated NAT AP runs a local subnet that needs NAT.
+IPV4_METHOD=$(nmcli -t -f ipv4.method connection show "$CONNECTION_UUID" 2>/dev/null | cut -d: -f2)
+if [ "$IPV4_METHOD" != "shared" ]; then
+    exit 0
+fi
+
 # Get the IP network for this interface
 IP_NET=$(ip -4 addr show "$IFACE" 2>/dev/null | grep inet | awk "{print \$2}" | head -1)
 if [ -z "$IP_NET" ]; then
