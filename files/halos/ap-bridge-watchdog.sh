@@ -26,10 +26,12 @@
 #
 # Contract with the switch orchestration (Unit 6, halos-org/cockpit#83):
 #   Before switching, Unit 6 captures eth0's current upstream default-route
-#   gateway and writes it to $EXPECTED_GW_FILE (persisted across reboot so the
-#   boot verdict can reject a rogue/wrong-network DHCP lease). This watchdog
-#   reads it; it never captures the pre-switch gateway itself (post-switch eth0
-#   is gone). On a healthy verdict it refreshes the file.
+#   gateway and writes it to $EXPECTED_GW_FILE. The watchdog reads it only in
+#   'switch' mode, where it is authoritative (anti-rogue during the vulnerable
+#   transition); it never captures the pre-switch gateway itself (post-switch
+#   eth0 is gone). The 'boot' verdict deliberately does NOT enforce gateway
+#   identity — a persisted baseline goes stale when the boat changes docks, and
+#   bridging onto whatever LAN eth0 reaches is the operator's accepted intent.
 #
 # Window/timeout constants are conservative starting points; they are tuned on
 # hardware in Unit 7 (cockpit-networkmanager-halos#16).
@@ -49,6 +51,7 @@ STATE_DIR="${STATE_DIR:-/var/lib/halos/ap-bridge}"
 EXPECTED_GW_FILE="${EXPECTED_GW_FILE:-$STATE_DIR/expected-gateway}"
 RUN_DIR="${RUN_DIR:-/run/halos}"
 BREADCRUMB="${BREADCRUMB:-$RUN_DIR/ap-bridge-watchdog.verdict}"
+LOCKFILE="${LOCKFILE:-$RUN_DIR/ap-bridge-watchdog.lock}"
 KEYFILE="${KEYFILE:-/etc/NetworkManager/system-connections/$AP_CON.nmconnection}"
 
 # Verdict windows (seconds). Boot settle is longer than the live-switch window.
@@ -122,10 +125,10 @@ ping_ok() {
 }
 
 # Poll the verdict until healthy or the window elapses. Echoes final verdict.
+# $2 is the expected gateway to enforce (empty = fail-open on identity).
 await_verdict() {
-    local window="$1" deadline verdict lease have_route lease_gw expected
+    local window="$1" expected="$2" deadline verdict lease have_route lease_gw
     deadline=$(( $(date +%s) + window ))
-    expected="$(read_expected_gateway)"
     while :; do
         lease="$(probe_br0_lease)"
         have_route="$(probe_default_route_present)"
@@ -180,12 +183,19 @@ revert_to_isolated() {
             ipv4.method auto ipv6.method auto autoconnect yes 2>/dev/null || true
     fi
 
-    # Tear down the bridge.
+    # Tear down the bridge, then bring up standalone eth0. Delete the bridge
+    # port/controller profiles BEFORE activating $ETH_CON so two profiles never
+    # race to claim eth0 (down alone leaves the autoconnect-capable profile).
     $NMCLI con down "$BR_ETH_CON" 2>/dev/null || true
     $NMCLI con down "$BRIDGE" 2>/dev/null || true
-    $NMCLI con up "$ETH_CON" 2>/dev/null || true
     $NMCLI con delete "$BR_ETH_CON" 2>/dev/null || true
     $NMCLI con delete "$BRIDGE" 2>/dev/null || true
+    $NMCLI con up "$ETH_CON" 2>/dev/null || true
+    # eth0 carries internet egress for the Isolated NAT island, not the
+    # management path (that is the AP on $ISOLATED_ADDR), and may legitimately
+    # be down if the wired link is what failed — so log, never gate on it.
+    $IP -4 addr show "$UPLINK" 2>/dev/null | grep -q 'inet ' || \
+        log "note: $UPLINK has no IPv4 after revert (wired uplink down?)"
 
     if [ "${NO_AP_UP:-0}" != "1" ]; then
         $NMCLI con up "$AP_CON" 2>/dev/null || true
@@ -203,45 +213,64 @@ revert_to_isolated() {
 }
 
 # --- Terminal fallback -------------------------------------------------------
-# If the revert could not bring the AP up on $ISOLATED_ADDR, rewrite the AP
-# keyfile to the factory Isolated shape (preserving the live psk) and restart
-# NetworkManager. Filesystem + service only — no nmcli orchestration left.
+# If the revert could not bring the AP up on $ISOLATED_ADDR, force the AP keyfile
+# to the factory Isolated shape by transforming the LIVE keyfile in place, then
+# restart NetworkManager. Filesystem + service only — no nmcli orchestration.
 
 terminal_fallback() {
     log "revert post-condition failed; running terminal fallback"
-    local psk ssid uuid band channel
-    # Read the live psk transiently; never log it, never pass via argv.
-    psk="$($NMCLI -s -g 802-11-wireless-security.psk con show "$AP_CON" 2>/dev/null || true)"
-    ssid="$($NMCLI -g 802-11-wireless.ssid con show "$AP_CON" 2>/dev/null || true)"
-    [ -n "$ssid" ] || ssid="$AP_CON"
-    # Preserve identity + radio config so NM accepts the profile and the AP can
-    # actually start: on the minimal AP firmware (no ACS) a channel-less AP may
-    # fail to come up, which would defeat this recovery.
-    uuid="$($NMCLI -g connection.uuid con show "$AP_CON" 2>/dev/null || true)"
-    [ -n "$uuid" ] || uuid="$(cat /proc/sys/kernel/random/uuid 2>/dev/null)"
-    band="$($NMCLI -g 802-11-wireless.band con show "$AP_CON" 2>/dev/null || true)"
-    channel="$($NMCLI -g 802-11-wireless.channel con show "$AP_CON" 2>/dev/null || true)"
+    if [ ! -r "$KEYFILE" ]; then
+        # Without the live keyfile we cannot preserve the psk; fabricating a
+        # profile risks a renamed or open AP, so surface the failure instead.
+        log "terminal fallback: $KEYFILE unreadable; cannot safely recover"
+        write_breadcrumb "stranded" "keyfile-unreadable"
+        return 1
+    fi
 
     local tmp
     tmp="$(mktemp)" || return 1
     chmod 0600 "$tmp"
-    {
-        printf '[connection]\nid=%s\nuuid=%s\ntype=802-11-wireless\ninterface-name=%s\nautoconnect=true\n\n' "$AP_CON" "$uuid" "$AP_IFACE"
-        printf '[802-11-wireless]\nmode=ap\nssid=%s\n' "$ssid"
-        [ -n "$band" ] && printf 'band=%s\n' "$band"
-        [ -n "$channel" ] && [ "$channel" != "0" ] && printf 'channel=%s\n' "$channel"
-        printf '\n'
-        if [ -n "$psk" ]; then
-            printf '[802-11-wireless-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$psk"
-        fi
-        printf '[ipv4]\nmethod=shared\n\n[ipv6]\nmethod=ignore\n'
-    } > "$tmp"
-    unset psk
+    # Transform the live keyfile: force ipv4=shared (no address) + ipv6=ignore,
+    # drop bridge membership, and pass [802-11-wireless] / [802-11-wireless-
+    # security] (ssid, band, channel, AND the psk) through BYTE-FOR-BYTE — so the
+    # psk is never re-escaped/whitespace-stripped and a secured AP never silently
+    # becomes open.
+    awk '
+        /^\[/ {
+            sec=$0
+            if (sec=="[ipv4]") { print "[ipv4]"; print "method=shared"; print ""; skip=1; v4=1; next }
+            if (sec=="[ipv6]") { print "[ipv6]"; print "method=ignore"; print ""; skip=1; v6=1; next }
+            if (sec=="[bridge-port]") { skip=1; next }
+            skip=0; print; next
+        }
+        skip { next }
+        sec=="[connection]" && /^(master|slave-type|controller|port-type)=/ { next }
+        { print }
+        END {
+            if (!v4) { print "[ipv4]"; print "method=shared" }
+            if (!v6) { print "[ipv6]"; print "method=ignore" }
+        }
+    ' "$KEYFILE" > "$tmp" || { rm -f "$tmp"; return 1; }
 
     install -D -m 0600 -o root -g root "$tmp" "$KEYFILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
     systemctl restart NetworkManager 2>/dev/null || true
-    return 0
+
+    # Never report success blind: confirm the AP actually came up on the
+    # Isolated address; otherwise mark the device stranded (observable).
+    nm-online -s -q -t 60 2>/dev/null || true
+    local _
+    for _ in 1 2 3 4 5 6 7 8; do
+        if ap_has_isolated_addr; then
+            write_breadcrumb "recovered" "terminal-fallback"
+            log "terminal fallback recovered the AP on $ISOLATED_ADDR"
+            return 0
+        fi
+        sleep 2
+    done
+    write_breadcrumb "stranded" "terminal-fallback-failed"
+    log "terminal fallback FAILED: AP not up on $ISOLATED_ADDR"
+    return 1
 }
 
 # --- Orchestration -----------------------------------------------------------
@@ -265,17 +294,19 @@ run_verdict() {
     if [ "$mode" = "boot" ]; then
         nm-online -s -q -t "$BOOT_SETTLE" 2>/dev/null || true
     fi
+    # Enforce gateway identity only at switch time, where the captured pre-switch
+    # gateway is authoritative (anti-rogue during the vulnerable transition). At
+    # boot the persisted baseline can be stale (the boat moved to a new dock), and
+    # bridging onto whatever LAN eth0 reaches is the operator's accepted intent
+    # (#79), so a qualifying lease + default route is enough — never false-revert
+    # a healthy AP just because the network changed.
+    local expected=""
+    [ "$mode" = "switch" ] && expected="$(read_expected_gateway)"
     local verdict reason
-    verdict="$(await_verdict "$window")"
+    verdict="$(await_verdict "$window" "$expected")"
     if [ "$verdict" = "healthy" ]; then
-        # Refresh the persisted gateway baseline for the next boot.
-        local gw; gw="$(probe_lease_gateway)"
-        if [ -n "$gw" ]; then
-            mkdir -p "$STATE_DIR" 2>/dev/null || true
-            printf '%s\n' "$gw" > "$EXPECTED_GW_FILE" 2>/dev/null || true
-        fi
         # Fail-open gateway reachability, recorded as a diagnostic only.
-        local reach; [ "$(ping_ok "$gw")" = "1" ] && reach=reachable || reach=unreachable
+        local reach; [ "$(ping_ok "$(probe_lease_gateway)")" = "1" ] && reach=reachable || reach=unreachable
         write_breadcrumb "healthy" "bridged-confirmed gateway=$reach"
         log "Bridged confirmed healthy ($mode); gateway $reach"
         return 0
@@ -288,6 +319,15 @@ run_verdict() {
 
 main() {
     local mode="${1:-boot}"
+
+    # Serialize the whole verdict+revert. The boot unit, a live-switch deadman,
+    # and a manual revert can otherwise overlap and race nmcli / an NM restart
+    # into a half-applied state — exactly what this watchdog exists to prevent.
+    mkdir -p "$RUN_DIR" 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1 && exec 9>"$LOCKFILE"; then
+        flock -w 150 9 || { log "another watchdog run holds the lock; exiting ($mode)"; return 0; }
+    fi
+
     case "$mode" in
         boot)
             run_verdict boot "$BOOT_SETTLE"
