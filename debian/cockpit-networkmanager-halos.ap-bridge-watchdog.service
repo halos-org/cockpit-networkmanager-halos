@@ -9,8 +9,15 @@ Wants=NetworkManager.service
 [Service]
 Type=oneshot
 ExecStart=/usr/libexec/halos/ap-bridge-watchdog.sh boot
-# Generous so a revert (which brings interfaces down/up) is never killed mid-way.
-TimeoutStartSec=300
+# Worst case: a boot run queues behind a concurrent switch/revert holding the
+# lock (FLOCK_WAIT=150s), then runs the full boot settle + verdict + revert +
+# terminal-fallback (NM restart) chain (~390s). 540s covers the true ceiling
+# with margin so a revert is never killed mid-way.
+TimeoutStartSec=540
+# On a non-clean exit (timeout / SIGKILL mid-revert) persist a stranded marker
+# to /var/lib (the /run verdict breadcrumb is tmpfs and isn't written when the
+# process is killed). The hook keys on $SERVICE_RESULT, so a clean run is a no-op.
+ExecStopPost=/usr/libexec/halos/ap-bridge-watchdog.sh mark-exit
 
 [Install]
 WantedBy=multi-user.target
