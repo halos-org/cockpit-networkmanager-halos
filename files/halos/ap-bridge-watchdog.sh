@@ -15,14 +15,37 @@
 # br0 short-circuits checkpoint rollback, and the dual-mode path has none).
 #
 # Modes (argv[1]):
+#   stash  - capture the AP psk to the persistent stash. Run by the enter-Bridged
+#            orchestration BEFORE enslaving the AP, while the psk is still in the
+#            keyfile (NM drops the in-file psk the moment the AP becomes a bridge
+#            port). Every post-enslave activation sources the psk from the stash.
+#   up     - psk-aware AP activation: re-feed the stashed psk via a transient
+#            passwd-file (a post-enslave con-up demands secrets even with the psk
+#            stored). Shared with the enter-Bridged orchestration (Unit 6).
 #   boot   - run at boot (After=NetworkManager.service): wait for network
 #            convergence, then verdict. Reverts a Bridged AP that did not come
-#            up healthy. No-op when the AP is not Bridged.
+#            up healthy; re-feeds the psk to a healthy one (NM cannot autoconnect
+#            an enslaved AP without the dropped in-file psk). No-op when the AP
+#            is not Bridged.
 #   switch - run by the live-switch deadman armed before an Isolated->Bridged
 #            switch (Unit 6): shorter window, same verdict + revert.
 #   revert - unconditional revert to Isolated (used by switch-back and
-#            disable-while-Bridged). With NO_AP_UP=1, leaves the AP down
+#            disable-while-Bridged). Restores the psk into the keyfile and clears
+#            the stash. With NO_AP_UP=1, leaves the AP down
 #            (disable-while-Bridged).
+#
+# psk handling (security): the psk only ever lives in 0600-root files — the NM
+# keyfile, the stash, and a transient passwd-file during activation. NM drops the
+# in-file psk the moment the AP becomes a bridge port, so the stash (captured
+# pre-enslave) is the recoverable source while Bridged; it is cleared on revert,
+# leaving the keyfile as the single copy while Isolated. (NM re-persists the psk
+# into the keyfile on a successful psk-flags=0 activation, so while Bridged both
+# may transiently hold it; both are 0600 root.) The stash holds the psk in its
+# verbatim keyfile-escaped form, so restoring it into a keyfile is byte-for-byte
+# (NM's escaping, e.g. a leading space written as \s, is preserved — a
+# hand-rewritten psk would risk an admin lockout). Activations unescape it into a
+# transient 0600 passwd-file; the psk never lands in argv, a log, or the
+# breadcrumb.
 #
 # Contract with the switch orchestration (Unit 6, halos-org/cockpit#83):
 #   Before switching, Unit 6 captures eth0's current upstream default-route
@@ -41,7 +64,9 @@ set -o pipefail
 # --- Identity / paths (overridable for tests) -------------------------------
 BRIDGE="${BRIDGE:-br0}"
 UPLINK="${UPLINK:-eth0}"
-AP_CON="${AP_CON:-Halos-AP}"
+# AP_CON is discovered from the AP interface at run time (see main) — the AP
+# connection id is hostname-derived (e.g. Halos-B7E8), not a fixed "Halos-AP".
+AP_CON="${AP_CON:-}"
 ETH_CON="${ETH_CON:-halos-eth0}"          # standalone DHCP eth0 profile (revert target)
 BR_ETH_CON="${BR_ETH_CON:-br0-eth0}"      # bridge port for eth0
 AP_IFACE="${AP_IFACE:-wlan0ap}"
@@ -49,16 +74,18 @@ ISOLATED_ADDR="${ISOLATED_ADDR:-10.42.0.1}"
 
 STATE_DIR="${STATE_DIR:-/var/lib/halos/ap-bridge}"
 EXPECTED_GW_FILE="${EXPECTED_GW_FILE:-$STATE_DIR/expected-gateway}"
+STASH="${STASH:-$STATE_DIR/psk}"   # 0600 root; verbatim keyfile-escaped psk while Bridged
 RUN_DIR="${RUN_DIR:-/run/halos}"
 BREADCRUMB="${BREADCRUMB:-$RUN_DIR/ap-bridge-watchdog.verdict}"
 LOCKFILE="${LOCKFILE:-$RUN_DIR/ap-bridge-watchdog.lock}"
-KEYFILE="${KEYFILE:-/etc/NetworkManager/system-connections/$AP_CON.nmconnection}"
+KEYFILE="${KEYFILE:-}"   # derived from the discovered AP_CON in main()
 
 # Verdict windows (seconds). Boot settle is longer than the live-switch window.
 BOOT_SETTLE="${BOOT_SETTLE:-90}"
 SWITCH_WINDOW="${SWITCH_WINDOW:-45}"
 POLL_INTERVAL="${POLL_INTERVAL:-3}"
 PING_TIMEOUT="${PING_TIMEOUT:-2}"
+FLOCK_WAIT="${FLOCK_WAIT:-150}"   # max wait for the serialization lock
 
 NMCLI="${NMCLI:-nmcli}"
 IP="${IP:-ip}"
@@ -157,6 +184,156 @@ write_breadcrumb() {
     chmod 0644 "$BREADCRUMB" 2>/dev/null || true
 }
 
+# The AP connection's keyfile path. NM does not rename the keyfile when the
+# connection id changes, so it cannot be derived from the id — discover it
+# (UUID-keyed, so a connection name containing a colon can't mis-split).
+ap_keyfile() {
+    local uuid
+    uuid="$($NMCLI -t -g connection.uuid connection show "$AP_CON" 2>/dev/null)"
+    [ -n "$uuid" ] || return 1
+    $NMCLI -t -f UUID,FILENAME connection show 2>/dev/null \
+        | awk -F: -v u="$uuid" '$1==u{print substr($0, length(u)+2); exit}'
+}
+
+# --- psk stash + (un)escape -------------------------------------------------
+# NM removes the in-file psk the moment the AP becomes a bridge port, so the psk
+# can only be captured BEFORE the first enslave. The stash holds it in its
+# verbatim keyfile-escaped form (byte-for-byte what NM wrote), which restores
+# into a keyfile losslessly; activations unescape it for the passwd-file.
+
+# Capture the AP psk to the stash from the live keyfile (called pre-enslave).
+# An open AP has no in-file psk: clear any stale stash and succeed. Fails (so the
+# enter-Bridged `set -e` aborts before enslaving) only on a write error — better
+# to abort the switch than to enslave with no recoverable psk.
+stash_psk() {
+    local psk tmp
+    [ -n "$KEYFILE" ] && [ -r "$KEYFILE" ] || { log "stash: keyfile unreadable ($KEYFILE)"; return 1; }
+    psk="$(sed -n 's/^psk=//p' "$KEYFILE" 2>/dev/null | head -1)"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    if [ -z "$psk" ]; then
+        rm -f "$STASH" 2>/dev/null || true
+        log "stash: no in-file psk (open AP?); nothing to stash"
+        return 0
+    fi
+    tmp="$(mktemp)" || return 1
+    chmod 0600 "$tmp"
+    printf '%s' "$psk" > "$tmp" || { rm -f "$tmp"; return 1; }
+    install -D -m 0600 -o root -g root "$tmp" "$STASH" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    log "stash: psk captured pre-enslave"
+}
+
+clear_stash() { rm -f "$STASH" 2>/dev/null || true; }
+
+# GKeyFile string unescape (\s space, \t tab, \n newline, \r CR, \\ backslash).
+# Value passed via the environment so awk does not re-process its backslashes.
+gkeyfile_unescape() {
+    V="$1" awk 'BEGIN{
+        v=ENVIRON["V"]
+        gsub(/\\\\/, "\001", v)
+        gsub(/\\s/, " ", v)
+        gsub(/\\t/, "\t", v)
+        gsub(/\\n/, "\n", v)
+        gsub(/\\r/, "\r", v)
+        gsub(/\001/, "\\", v)
+        printf "%s", v
+    }'
+}
+
+# The verbatim (keyfile-escaped) psk, for byte-for-byte injection into a keyfile.
+# Stash first (authoritative while Bridged), else the keyfile's own psk.
+psk_verbatim() {
+    local v
+    if [ -r "$STASH" ]; then
+        v="$(cat "$STASH" 2>/dev/null)"
+        [ -n "$v" ] && { printf '%s' "$v"; return; }
+    fi
+    [ -n "$KEYFILE" ] && [ -r "$KEYFILE" ] && sed -n 's/^psk=//p' "$KEYFILE" 2>/dev/null | head -1
+}
+
+# The raw (unescaped) psk secret, for the passwd-file. Stash first (unescaped);
+# else nmcli -s (already raw, works only while not enslaved); else the keyfile.
+psk_raw() {
+    local v
+    if [ -r "$STASH" ]; then
+        v="$(cat "$STASH" 2>/dev/null)"
+        [ -n "$v" ] && { gkeyfile_unescape "$v"; return; }
+    fi
+    v="$($NMCLI -s -g 802-11-wireless-security.psk connection show "$AP_CON" 2>/dev/null)"
+    [ -n "$v" ] && { printf '%s' "$v"; return; }
+    if [ -n "$KEYFILE" ] && [ -r "$KEYFILE" ]; then
+        v="$(sed -n 's/^psk=//p' "$KEYFILE" 2>/dev/null | head -1)"
+        [ -n "$v" ] && gkeyfile_unescape "$v"
+    fi
+}
+
+# Bring the AP up, re-feeding the psk via a transient 0600 passwd-file. After an
+# enslave NM raises "Secrets were required" on the next activation even with the
+# psk stored, so an explicit re-feed is required (verified on hardware). The psk
+# never lands in argv, a log, or the breadcrumb.
+ap_up() {
+    local psk pf rc
+    psk="$(psk_raw)"
+    if [ -n "$psk" ]; then
+        pf="$(mktemp)" || return 1
+        chmod 0600 "$pf"
+        printf '802-11-wireless-security.psk:%s\n' "$psk" > "$pf"
+        unset psk
+        $NMCLI connection up "$AP_CON" passwd-file "$pf" 2>/dev/null; rc=$?
+        rm -f "$pf"
+        return $rc
+    fi
+    $NMCLI connection up "$AP_CON" 2>/dev/null
+}
+
+# Transform the AP keyfile to the Isolated shape on stdout: force ipv4=shared (no
+# address) + ipv6=ignore, drop bridge membership, and ensure [wifi-security]
+# carries psk=<verbatim>. The psk is injected from the stash (or the keyfile's
+# own psk) BYTE-FOR-BYTE via the environment so NM's escaping is preserved — a
+# hand-rewritten psk would risk an admin lockout. A secured AP never silently
+# becomes open: an existing psk line is dropped and re-emitted from the source.
+rewrite_keyfile_isolated() {
+    local src="$1"
+    PSK_VERBATIM="$(psk_verbatim)" awk '
+        /^\[/ {
+            sec=$0
+            if (sec=="[ipv4]") { print "[ipv4]"; print "method=shared"; print ""; skip=1; v4=1; next }
+            if (sec=="[ipv6]") { print "[ipv6]"; print "method=ignore"; print ""; skip=1; v6=1; next }
+            if (sec=="[bridge-port]") { skip=1; next }
+            skip=0; print
+            if ((sec=="[wifi-security]" || sec=="[802-11-wireless-security]") && ENVIRON["PSK_VERBATIM"]!="")
+                print "psk=" ENVIRON["PSK_VERBATIM"]
+            next
+        }
+        skip { next }
+        sec=="[connection]" && /^(master|slave-type|controller|port-type)=/ { next }
+        (sec=="[wifi-security]" || sec=="[802-11-wireless-security]") && /^psk=/ { next }
+        { print }
+        END {
+            if (!v4) { print "[ipv4]"; print "method=shared" }
+            if (!v6) { print "[ipv6]"; print "method=ignore" }
+        }
+    ' "$src"
+}
+
+# Restore the live keyfile to the Isolated shape (with the psk) and reload NM so
+# the persisted profile regains the psk for the next boot. Returns 0 only if the
+# keyfile now actually holds the psk (the caller may then clear the stash, the
+# last copy). A secured profile (key-mgmt set) with no psk= line means the source
+# psk was unavailable — fail so the stash is kept and the failure surfaces.
+restore_isolated_keyfile() {
+    local tmp
+    [ -n "$KEYFILE" ] && [ -r "$KEYFILE" ] || return 1
+    tmp="$(mktemp)" || return 1
+    chmod 0600 "$tmp"
+    rewrite_keyfile_isolated "$KEYFILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    install -D -m 0600 -o root -g root "$tmp" "$KEYFILE" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    $NMCLI connection reload 2>/dev/null || true
+    # A secured AP must keep its psk: not-secured OR psk-present is success.
+    ! grep -qE '^key-mgmt=' "$KEYFILE" 2>/dev/null || grep -q '^psk=' "$KEYFILE" 2>/dev/null
+}
+
 # --- Revert primitive (shared by all revert callers) -------------------------
 # Restore the canonical Isolated shape and tear down the bridge. NO_AP_UP=1
 # leaves the AP down (disable-while-Bridged). Returns 0 if the live
@@ -197,16 +374,29 @@ revert_to_isolated() {
     $IP -4 addr show "$UPLINK" 2>/dev/null | grep -q 'inet ' || \
         log "note: $UPLINK has no IPv4 after revert (wired uplink down?)"
 
-    if [ "${NO_AP_UP:-0}" != "1" ]; then
-        $NMCLI con up "$AP_CON" 2>/dev/null || true
-    else
+    # Restore the psk into the keyfile (NM dropped the in-file copy while the AP
+    # was a bridge port) so the persisted profile activates on the next boot. On
+    # success the keyfile is again the single psk copy and the stash can be
+    # cleared; until then the stash is the only copy, so keep it.
+    local kf_ok=1
+    restore_isolated_keyfile || kf_ok=0
+
+    if [ "${NO_AP_UP:-0}" = "1" ]; then
+        # disable-while-Bridged: leave the AP down, but the keyfile is now
+        # Isolated+psk so a later re-enable works.
+        [ "$kf_ok" = "1" ] && clear_stash
         return 0
     fi
+
+    ap_up || true
 
     # Live post-condition: the AP must actually hold the Isolated address.
     local _
     for _ in 1 2 3 4 5 6; do
-        ap_has_isolated_addr && return 0
+        if ap_has_isolated_addr; then
+            [ "$kf_ok" = "1" ] && clear_stash
+            return 0
+        fi
         sleep 2
     done
     return 1
@@ -220,8 +410,8 @@ revert_to_isolated() {
 terminal_fallback() {
     log "revert post-condition failed; running terminal fallback"
     if [ ! -r "$KEYFILE" ]; then
-        # Without the live keyfile we cannot preserve the psk; fabricating a
-        # profile risks a renamed or open AP, so surface the failure instead.
+        # Without the live keyfile we cannot reconstruct the AP safely (a
+        # fabricated profile risks a renamed or open AP), so surface the failure.
         log "terminal fallback: $KEYFILE unreadable; cannot safely recover"
         write_breadcrumb "stranded" "keyfile-unreadable"
         return 1
@@ -230,27 +420,10 @@ terminal_fallback() {
     local tmp
     tmp="$(mktemp)" || { write_breadcrumb "stranded" "terminal-fallback-write-failed"; return 1; }
     chmod 0600 "$tmp"
-    # Transform the live keyfile: force ipv4=shared (no address) + ipv6=ignore,
-    # drop bridge membership, and pass [802-11-wireless] / [802-11-wireless-
-    # security] (ssid, band, channel, AND the psk) through BYTE-FOR-BYTE — so the
-    # psk is never re-escaped/whitespace-stripped and a secured AP never silently
-    # becomes open.
-    awk '
-        /^\[/ {
-            sec=$0
-            if (sec=="[ipv4]") { print "[ipv4]"; print "method=shared"; print ""; skip=1; v4=1; next }
-            if (sec=="[ipv6]") { print "[ipv6]"; print "method=ignore"; print ""; skip=1; v6=1; next }
-            if (sec=="[bridge-port]") { skip=1; next }
-            skip=0; print; next
-        }
-        skip { next }
-        sec=="[connection]" && /^(master|slave-type|controller|port-type)=/ { next }
-        { print }
-        END {
-            if (!v4) { print "[ipv4]"; print "method=shared" }
-            if (!v6) { print "[ipv6]"; print "method=ignore" }
-        }
-    ' "$KEYFILE" > "$tmp" || { rm -f "$tmp"; write_breadcrumb "stranded" "terminal-fallback-write-failed"; return 1; }
+    # Transform the live keyfile to the Isolated shape, re-injecting the stashed
+    # psk byte-for-byte (NM dropped the in-file copy while the AP was a bridge
+    # port, so it cannot be passed through — it must come from the stash).
+    rewrite_keyfile_isolated "$KEYFILE" > "$tmp" || { rm -f "$tmp"; write_breadcrumb "stranded" "terminal-fallback-write-failed"; return 1; }
 
     install -D -m 0600 -o root -g root "$tmp" "$KEYFILE" 2>/dev/null || { rm -f "$tmp"; write_breadcrumb "stranded" "terminal-fallback-write-failed"; return 1; }
     rm -f "$tmp"
@@ -262,6 +435,7 @@ terminal_fallback() {
     local _
     for _ in 1 2 3 4 5 6 7 8; do
         if ap_has_isolated_addr; then
+            clear_stash
             write_breadcrumb "recovered" "terminal-fallback"
             log "terminal fallback recovered the AP on $ISOLATED_ADDR"
             return 0
@@ -305,10 +479,17 @@ run_verdict() {
     local verdict reason
     verdict="$(await_verdict "$window" "$expected")"
     if [ "$verdict" = "healthy" ]; then
+        # br0 (the management path) is healthy; ensure the AP radio is actually
+        # serving. NM cannot autoconnect an enslaved AP after a reboot because it
+        # dropped the in-file psk, so re-feed it from the stash (idempotent when
+        # the AP is already up, e.g. the switch apply just brought it up). Note a
+        # re-feed failure in the breadcrumb rather than reporting healthy blind —
+        # management via br0 still works, so this is observability, not a revert.
+        local ap_note=""; ap_up || ap_note=" ap-refeed-failed"
         # Fail-open gateway reachability, recorded as a diagnostic only.
         local reach; [ "$(ping_ok "$(probe_lease_gateway)")" = "1" ] && reach=reachable || reach=unreachable
-        write_breadcrumb "healthy" "bridged-confirmed gateway=$reach"
-        log "Bridged confirmed healthy ($mode); gateway $reach"
+        write_breadcrumb "healthy" "bridged-confirmed gateway=$reach$ap_note"
+        log "Bridged confirmed healthy ($mode); gateway $reach$ap_note"
         return 0
     fi
     reason="${verdict#unhealthy:}"
@@ -320,12 +501,43 @@ run_verdict() {
 main() {
     local mode="${1:-boot}"
 
+    # Discover the managed AP connection by its interface (id is hostname-derived,
+    # not a fixed name). An explicit AP_CON env still overrides. Fall back to the
+    # historical default only if nothing is bound to the AP interface.
+    if [ -z "$AP_CON" ]; then
+        # At boot the AP interface may not yet be claimed by a connection: the
+        # unit is ordered only After=NetworkManager.service, which gates on NM
+        # *starting*, not on connection activation. Discovering too early returns
+        # empty, the fallback id is wrong, and the bridged check then FALSE-SKIPS
+        # a Bridged AP (it would never be reverted if unhealthy). Wait, bounded,
+        # for the binding. The AP rides wlan0ap independent of the uplink, so this
+        # resolves quickly for an Isolated device too.
+        if [ "$mode" = "boot" ]; then
+            local _deadline; _deadline=$(( $(date +%s) + BOOT_SETTLE ))
+            while [ -z "$($NMCLI -t -g GENERAL.CONNECTION device show "$AP_IFACE" 2>/dev/null)" ] \
+                  && [ "$(date +%s)" -lt "$_deadline" ]; do sleep 1; done
+        fi
+        AP_CON="$($NMCLI -t -g GENERAL.CONNECTION device show "$AP_IFACE" 2>/dev/null)"
+        [ -n "$AP_CON" ] || AP_CON="Halos-AP"
+    fi
+    # Discover the keyfile path (not derivable from the id); fall back to the
+    # id-based path only if discovery fails.
+    KEYFILE="${KEYFILE:-$(ap_keyfile)}"
+    KEYFILE="${KEYFILE:-/etc/NetworkManager/system-connections/$AP_CON.nmconnection}"
+
     # Serialize the whole verdict+revert. The boot unit, a live-switch deadman,
     # and a manual revert can otherwise overlap and race nmcli / an NM restart
     # into a half-applied state — exactly what this watchdog exists to prevent.
+    # On lock-timeout the exit code is mode-aware: the apply-gated modes
+    # (stash/up, run under the enter-Bridged `set -e`) FAIL so the apply aborts
+    # before enslaving with no captured psk; the verdict modes succeed-quietly
+    # because another run legitimately owns the critical section.
     mkdir -p "$RUN_DIR" 2>/dev/null || true
     if command -v flock >/dev/null 2>&1 && exec 9>"$LOCKFILE"; then
-        flock -w 150 9 || { log "another watchdog run holds the lock; exiting ($mode)"; return 0; }
+        flock -w "$FLOCK_WAIT" 9 || {
+            log "another watchdog run holds the lock; exiting ($mode)"
+            case "$mode" in stash|up) return 1 ;; *) return 0 ;; esac
+        }
     fi
 
     case "$mode" in
@@ -339,8 +551,20 @@ main() {
             write_breadcrumb "reverted" "explicit-revert"
             do_revert
             ;;
+        up)
+            # psk-aware AP activation, shared with the switch orchestration
+            # (Unit 6) so the post-enslave con-up re-feeds the psk identically.
+            ap_up
+            ;;
+        stash)
+            # Capture the psk before the enter-Bridged enslave drops the in-file
+            # copy. Any failure (write error, or the lock-timeout above)
+            # propagates so the apply's `set -e` aborts before enslaving — better
+            # than enslaving with no recoverable psk source.
+            stash_psk
+            ;;
         *)
-            echo "usage: $0 {boot|switch|revert}" >&2
+            echo "usage: $0 {stash|up|boot|switch|revert}" >&2
             return 2
             ;;
     esac
