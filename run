@@ -122,6 +122,17 @@ function hooks-run {
   lefthook run pre-commit
 }
 
+function test {
+  #@ Run the watchdog sourced unit tests (no NetworkManager needed)
+  #@ Category: Utility
+  if command -v shellcheck &> /dev/null; then
+    shellcheck files/halos/ap-bridge-watchdog.sh test/ap-bridge-watchdog.test.sh
+  else
+    echo "note: shellcheck not found; skipping lint"
+  fi
+  bash test/ap-bridge-watchdog.test.sh
+}
+
 function help {
   #@ Show available commands
   echo "cockpit-networkmanager-halos development commands:"
@@ -156,7 +167,7 @@ shift
 
 # Run command
 case "$COMMAND" in
-  build|bumpversion|deploy|test-cycle|docker-build|clean|hooks-install|hooks-run|help)
+  build|bumpversion|deploy|test|test-cycle|docker-build|clean|hooks-install|hooks-run|help)
     "$COMMAND" "$@"
     ;;
   *)

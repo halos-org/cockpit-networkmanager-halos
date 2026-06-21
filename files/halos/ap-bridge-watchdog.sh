@@ -28,11 +28,16 @@
 #            an enslaved AP without the dropped in-file psk). No-op when the AP
 #            is not Bridged.
 #   switch - run by the live-switch deadman armed before an Isolated->Bridged
-#            switch (Unit 6): shorter window, same verdict + revert.
+#            switch (Unit 6): shorter window, same verdict + revert. Also reverts
+#            a half-built bridge left by an apply that aborted before enslaving
+#            the AP (a partial switch), which boot deliberately does not.
 #   revert - unconditional revert to Isolated (used by switch-back and
 #            disable-while-Bridged). Restores the psk into the keyfile and clears
 #            the stash. With NO_AP_UP=1, leaves the AP down
 #            (disable-while-Bridged).
+#   mark-exit - ExecStopPost hook: on a non-clean service exit (timeout / kill)
+#            persist a stranded marker to $STATE_DIR (the /run breadcrumb is
+#            tmpfs). No AP discovery, no lock, no NM interaction.
 #
 # psk handling (security): the psk only ever lives in 0600-root files — the NM
 # keyfile, the stash, and a transient passwd-file during activation. NM drops the
@@ -75,6 +80,7 @@ ISOLATED_ADDR="${ISOLATED_ADDR:-10.42.0.1}"
 STATE_DIR="${STATE_DIR:-/var/lib/halos/ap-bridge}"
 EXPECTED_GW_FILE="${EXPECTED_GW_FILE:-$STATE_DIR/expected-gateway}"
 STASH="${STASH:-$STATE_DIR/psk}"   # 0600 root; verbatim keyfile-escaped psk while Bridged
+EXIT_MARKER="${EXIT_MARKER:-$STATE_DIR/last-exit}"  # persistent non-clean-exit marker (survives reboot)
 RUN_DIR="${RUN_DIR:-/run/halos}"
 BREADCRUMB="${BREADCRUMB:-$RUN_DIR/ap-bridge-watchdog.verdict}"
 LOCKFILE="${LOCKFILE:-$RUN_DIR/ap-bridge-watchdog.lock}"
@@ -174,6 +180,43 @@ is_ap_bridged() {
     st="$($NMCLI -t -f connection.slave-type connection show "$AP_CON" 2>/dev/null | cut -d: -f2)"
     master="$($NMCLI -t -f connection.master connection show "$AP_CON" 2>/dev/null | cut -d: -f2)"
     [ "$st" = "bridge" ] || [ -n "$master" ]
+}
+
+# Positive partial-switch discriminator: the bridge is built (br0 connected with
+# eth0 enslaved as its port) but the AP is NOT a bridge port. This is the unique
+# signature an aborted enter-Bridged leaves (eth0 was downed and enslaved before
+# the AP enslave step failed). It must NOT match a healthy completed bridge —
+# there the AP *is* a port — so callers gate this behind `! is_ap_bridged`.
+is_partial_switch() {
+    local br_state eth_con
+    # nmcli GENERAL.STATE is "<code> (<text>)"; 100 == connected. Match the code,
+    # not the text — "disconnected" contains the substring "connected".
+    br_state="$($NMCLI -t -f GENERAL.STATE device show "$BRIDGE" 2>/dev/null | cut -d: -f2)"
+    eth_con="$($NMCLI -t -g GENERAL.CONNECTION device show "$UPLINK" 2>/dev/null)"
+    [ "${br_state%% *}" = "100" ] || return 1
+    [ "$eth_con" = "$BR_ETH_CON" ]
+}
+
+# ExecStopPost hook: persist a stranded marker on a NON-CLEAN exit (systemd
+# timeout / SIGKILL mid-revert). The /run verdict breadcrumb is tmpfs (lost on
+# power-cycle) and is never written when systemd kills the process, so an
+# operator otherwise can't tell after a reboot that the last run was force-
+# terminated. Gate SOLELY on $SERVICE_RESULT: for a Type=oneshot timeout/signal,
+# $EXIT_STATUS is empty or a signal NAME (never a numeric 0), so a numeric
+# comparison would misfire on exactly the case this exists to catch.
+mark_exit() {
+    [ "${SERVICE_RESULT:-success}" = "success" ] && return 0
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    printf 'verdict=stranded\nreason=service-%s\nexit_status=%s\ntimestamp=%s\n' \
+        "${SERVICE_RESULT:-unknown}" "${EXIT_STATUS:-}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        > "$EXIT_MARKER" 2>/dev/null || true
+    chmod 0644 "$EXIT_MARKER" 2>/dev/null || true
+    # Don't claim success blind: only log "wrote" if the marker actually landed.
+    if [ -e "$EXIT_MARKER" ]; then
+        log "non-clean exit (SERVICE_RESULT=${SERVICE_RESULT:-unknown}); wrote stranded marker"
+    else
+        log "non-clean exit (SERVICE_RESULT=${SERVICE_RESULT:-unknown}); FAILED to write stranded marker"
+    fi
 }
 
 write_breadcrumb() {
@@ -459,6 +502,24 @@ do_revert() {
 run_verdict() {
     local mode="$1" window="$2"
     if ! is_ap_bridged; then
+        # Switch mode only: an aborted enter-Bridged can strand the device in a
+        # half-built bridge (br0 up, eth0 enslaved) with the AP NOT yet a port.
+        # Revert that partial state back to a reachable Isolated AP. Boot and all
+        # other modes keep the plain skip — a legitimately non-bridged device
+        # must never be reverted (that would be a needless outage).
+        if [ "$mode" = "switch" ] && is_partial_switch; then
+            # is_ap_bridged is a single un-retried nmcli read and switch mode has
+            # no boot settle, so re-confirm after a short pause that the AP is
+            # still not a port (and the half-state persists) before acting on a
+            # possible transient false-negative.
+            sleep "$POLL_INTERVAL"
+            if ! is_ap_bridged && is_partial_switch; then
+                write_breadcrumb "reverted" "partial-switch"
+                log "partial switch detected (bridge built, AP not enslaved); reverting"
+                do_revert
+                return
+            fi
+        fi
         write_breadcrumb "skipped" "ap-not-bridged"
         log "AP is not Bridged; nothing to verify ($mode)"
         return 0
@@ -501,24 +562,40 @@ run_verdict() {
 main() {
     local mode="${1:-boot}"
 
+    # mark-exit is an ExecStopPost hook: no AP discovery, no lock, no NM — it only
+    # records systemd's exit result. Handle it before everything else.
+    if [ "$mode" = "mark-exit" ]; then
+        mark_exit
+        return
+    fi
+
     # Discover the managed AP connection by its interface (id is hostname-derived,
-    # not a fixed name). An explicit AP_CON env still overrides. Fall back to the
-    # historical default only if nothing is bound to the AP interface.
+    # not a fixed name). An explicit AP_CON env still overrides.
     if [ -z "$AP_CON" ]; then
         # At boot the AP interface may not yet be claimed by a connection: the
         # unit is ordered only After=NetworkManager.service, which gates on NM
         # *starting*, not on connection activation. Discovering too early returns
-        # empty, the fallback id is wrong, and the bridged check then FALSE-SKIPS
-        # a Bridged AP (it would never be reverted if unhealthy). Wait, bounded,
-        # for the binding. The AP rides wlan0ap independent of the uplink, so this
-        # resolves quickly for an Isolated device too.
+        # empty. Wait, bounded, for the binding. The AP rides wlan0ap independent
+        # of the uplink, so this resolves quickly for an Isolated device too.
         if [ "$mode" = "boot" ]; then
             local _deadline; _deadline=$(( $(date +%s) + BOOT_SETTLE ))
             while [ -z "$($NMCLI -t -g GENERAL.CONNECTION device show "$AP_IFACE" 2>/dev/null)" ] \
                   && [ "$(date +%s)" -lt "$_deadline" ]; do sleep 1; done
         fi
         AP_CON="$($NMCLI -t -g GENERAL.CONNECTION device show "$AP_IFACE" 2>/dev/null)"
-        [ -n "$AP_CON" ] || AP_CON="Halos-AP"
+    fi
+    # No connection is bound to the AP interface. Never synthesize a fake id (the
+    # old "Halos-AP" fallback): is_ap_bridged / keyfile derivation off a
+    # non-existent connection would FALSE-SKIP a possibly-unhealthy Bridged AP.
+    # Apply-gated modes (stash/up) FAIL so the enter-Bridged `set -e` aborts;
+    # verdict modes surface it honestly and do nothing destructive (there is
+    # nothing safe to revert when the AP can't even be identified).
+    if [ -z "$AP_CON" ]; then
+        log "AP connection not discovered on $AP_IFACE ($mode)"
+        case "$mode" in
+            stash|up) return 1 ;;
+            *) write_breadcrumb "undetermined" "ap-con-not-discovered"; return 0 ;;
+        esac
     fi
     # Discover the keyfile path (not derivable from the id); fall back to the
     # id-based path only if discovery fails.
@@ -564,7 +641,7 @@ main() {
             stash_psk
             ;;
         *)
-            echo "usage: $0 {stash|up|boot|switch|revert}" >&2
+            echo "usage: $0 {stash|up|boot|switch|revert|mark-exit}" >&2
             return 2
             ;;
     esac
