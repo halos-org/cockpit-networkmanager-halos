@@ -49,12 +49,19 @@ override_dh_auto_install:
 	install -D -m 0750 files/halos/ap-bridge-watchdog.sh \
 		debian/cockpit-networkmanager-halos/usr/libexec/halos/ap-bridge-watchdog.sh
 
+	# Install the docker.service drop-in that re-applies the br0 FORWARD ACCEPT
+	# on every Docker (re)start (covers the paths a systemd PartOf= misses).
+	install -D -m 0644 files/systemd/docker.service.d/10-ap-bridge-fwd.conf \
+		debian/cockpit-networkmanager-halos/usr/lib/systemd/system/docker.service.d/10-ap-bridge-fwd.conf
+
 override_dh_auto_test:
 	# Skip tests for now (will be added in Issue #10)
 	@echo "Skipping tests"
 
-# The watchdog boot unit is a named systemd unit; dh_installsystemd's autodetect
-# only picks up the default <package>.service, so enable it explicitly so the
-# maintainer scripts generate enable/start (postinst) + disable/stop (postrm).
+# The watchdog boot unit and the Docker-FORWARD unit are named systemd units;
+# dh_installsystemd's autodetect only picks up the default <package>.service, so
+# enable each explicitly so the maintainer scripts generate enable/start
+# (postinst) + disable/stop (postrm).
 override_dh_installsystemd:
 	dh_installsystemd --name=ap-bridge-watchdog
+	dh_installsystemd --name=ap-bridge-fwd
