@@ -1,0 +1,18 @@
+[Unit]
+Description=HaLOS bridged-AP: allow br0 client forwarding past Docker's FORWARD DROP
+Documentation=https://github.com/halos-org/cockpit-networkmanager-halos/issues/22
+# Initial apply after Docker at boot, and rule cleanup on stop / package removal.
+# Re-application on later docker (re)starts is owned by the docker.service
+# drop-in (10-ap-bridge-fwd.conf), which fires on EVERY docker start — including
+# the socket re-activation, stop+start, and crash auto-restart paths a systemd
+# PartOf= would silently miss.
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/halos/ap-bridge-watchdog.sh fwd-up
+ExecStop=/usr/libexec/halos/ap-bridge-watchdog.sh fwd-down
+
+[Install]
+WantedBy=multi-user.target

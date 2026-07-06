@@ -38,6 +38,12 @@
 #   mark-exit - ExecStopPost hook: on a non-clean service exit (timeout / kill)
 #            persist a stranded marker to $STATE_DIR (the /run breadcrumb is
 #            tmpfs). No AP discovery, no lock, no NM interaction.
+#   fwd-up / fwd-down - add / remove the DOCKER-USER FORWARD ACCEPT that lets
+#            Bridged-AP clients reach the upstream DHCP server past Docker's
+#            FORWARD DROP policy. Self-contained (no AP discovery, no lock, no NM);
+#            run by ap-bridge-fwd.service (boot apply + removal cleanup) and a
+#            docker.service drop-in (re-apply on every docker start). See
+#            ensure_docker_fwd for why the rule is kept present unconditionally.
 #
 # psk handling (security): the psk only ever lives in 0600-root files — the NM
 # keyfile, the stash, and a transient passwd-file during activation. NM drops the
@@ -92,10 +98,15 @@ SWITCH_WINDOW="${SWITCH_WINDOW:-45}"
 POLL_INTERVAL="${POLL_INTERVAL:-3}"
 PING_TIMEOUT="${PING_TIMEOUT:-2}"
 FLOCK_WAIT="${FLOCK_WAIT:-150}"   # max wait for the serialization lock
+FWD_WAIT="${FWD_WAIT:-30}"        # max wait for Docker to create the DOCKER-USER chain
 
 NMCLI="${NMCLI:-nmcli}"
 IP="${IP:-ip}"
 PING="${PING:-ping}"
+IPTABLES="${IPTABLES:-iptables}"
+FWD_CHAIN="${FWD_CHAIN:-DOCKER-USER}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+DOCKER_UNIT="${DOCKER_UNIT:-docker.service}"
 
 log() { logger -t ap-bridge-watchdog "$*" 2>/dev/null || true; }
 
@@ -490,6 +501,79 @@ terminal_fallback() {
     return 1
 }
 
+# --- Docker FORWARD interop (bridged-AP client DHCP) -------------------------
+# Docker sets net.bridge.bridge-nf-call-iptables=1 and the FORWARD policy to
+# DROP, and only whitelists its OWN bridges. Once the AP is Bridged, a wireless
+# client's frames bridged across $BRIDGE (client <-> upstream gateway, seen by
+# iptables as -i $BRIDGE -o $BRIDGE) match no rule and hit the DROP — clients
+# associate but never obtain a DHCP lease. The device's own $BRIDGE lease keeps
+# working (local INPUT, not FORWARD), so the health verdict stays green and the
+# breakage is invisible from the device side.
+#
+# Fix: mirror Docker's own per-bridge ACCEPT, in DOCKER-USER (the chain Docker
+# preserves across its rule regeneration). The rule is inert while Isolated
+# ($BRIDGE does not exist, so it never matches) and takes effect the instant
+# $BRIDGE appears, so it is kept present unconditionally rather than toggled by
+# mode — which also makes a live Isolated->Bridged switch work with no extra
+# step. Docker recreates DOCKER-USER empty on EVERY daemon start (boot, restart,
+# socket re-activation, crash auto-restart), so the rule is re-applied after
+# Docker by a docker.service drop-in (ExecStartPost) that fires on every start —
+# not by a systemd PartOf=, which propagates only explicit restart/stop jobs and
+# would silently miss the socket, stop+start, and crash-restart paths.
+#
+# The `iptables` calls take the xtables lock with `-w`: fwd-up runs right after
+# docker.service becomes active, when Docker is still writing its own rules and
+# holding the lock, so an unlocked call would fail-fast and leave the rule off.
+
+# Whether the Docker daemon is up. Lets fwd-up tell "Docker not installed/running"
+# (rule irrelevant -> success) from "Docker up but its chain never appeared"
+# (real failure worth surfacing) when the DOCKER-USER wait times out.
+docker_active() {
+    command -v "$SYSTEMCTL" >/dev/null 2>&1 || return 1
+    $SYSTEMCTL is-active --quiet "$DOCKER_UNIT" 2>/dev/null
+}
+
+ensure_docker_fwd() {
+    command -v "$IPTABLES" >/dev/null 2>&1 || { log "fwd: no $IPTABLES; skipping"; return 0; }
+    # DOCKER-USER exists only once Docker has built its chains. Docker creates it
+    # asynchronously, so wait (bounded).
+    local deadline; deadline=$(( $(date +%s) + FWD_WAIT ))
+    while ! $IPTABLES -n -L "$FWD_CHAIN" >/dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            if docker_active; then
+                # Docker is up but its chain never appeared (slow start, an
+                # iptables-backend mismatch, or lock loss). The rule is required
+                # and NOT installed — fail so the unit surfaces it, rather than
+                # reporting success and hiding broken bridged-client DHCP.
+                log "fwd: Docker active but $FWD_CHAIN absent after ${FWD_WAIT}s; rule NOT installed"
+                return 1
+            fi
+            log "fwd: $FWD_CHAIN absent and Docker not active; nothing to do"
+            return 0
+        fi
+        sleep 1
+    done
+    if $IPTABLES -w 5 -C "$FWD_CHAIN" -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT 2>/dev/null; then
+        return 0   # already present (idempotent)
+    fi
+    if $IPTABLES -w 5 -I "$FWD_CHAIN" -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT 2>/dev/null; then
+        log "fwd: added $BRIDGE forward ACCEPT to $FWD_CHAIN"
+        return 0
+    fi
+    log "fwd: FAILED to add $BRIDGE forward ACCEPT to $FWD_CHAIN"
+    return 1
+}
+
+remove_docker_fwd() {
+    command -v "$IPTABLES" >/dev/null 2>&1 || return 0
+    $IPTABLES -n -L "$FWD_CHAIN" >/dev/null 2>&1 || return 0
+    # Delete every copy (idempotent; tolerate the rule already being absent).
+    while $IPTABLES -w 5 -C "$FWD_CHAIN" -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT 2>/dev/null; do
+        $IPTABLES -w 5 -D "$FWD_CHAIN" -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT 2>/dev/null || break
+    done
+    log "fwd: ensured $BRIDGE forward ACCEPT absent from $FWD_CHAIN"
+}
+
 # --- Orchestration -----------------------------------------------------------
 
 do_revert() {
@@ -569,6 +653,14 @@ main() {
         return
     fi
 
+    # fwd-up/fwd-down are self-contained iptables ops (no AP discovery, no NM, no
+    # lock): the rule is inert while Isolated, so it needs no bridged-state check
+    # and never races the verdict/revert critical section. Handle them here.
+    case "$mode" in
+        fwd-up)   ensure_docker_fwd; return ;;
+        fwd-down) remove_docker_fwd; return ;;
+    esac
+
     # Discover the managed AP connection by its interface (id is hostname-derived,
     # not a fixed name). An explicit AP_CON env still overrides.
     if [ -z "$AP_CON" ]; then
@@ -641,7 +733,7 @@ main() {
             stash_psk
             ;;
         *)
-            echo "usage: $0 {stash|up|boot|switch|revert|mark-exit}" >&2
+            echo "usage: $0 {stash|up|boot|switch|revert|mark-exit|fwd-up|fwd-down}" >&2
             return 2
             ;;
     esac
